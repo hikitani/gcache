@@ -35,23 +35,24 @@ func (i *Item) updateTimeAccess() {
 }
 
 type cacheImpl struct {
-	// Хранилище значений
+	// Key-value store
 	kv   map[string]*Item
 	kvMu sync.RWMutex
 
-	// Хранилище ключей, который используется для перебора по индексу
+	// Index-key store
 	keys map[int]string
 	kMu  sync.RWMutex
-	// Хранит последний индекс в хранилище ключей
+	// Last index within keys
 	lastIdx   int
 	lastIdxMu sync.RWMutex
-	// Перебираемый индекс в хранилище ключей
+	// Гsed to iterate over keys
 	it   int
 	itMu sync.RWMutex
 
-	// Свободные индексы
+	// Free indexes
 	freeIds *stack
 
+	// Default TTL
 	ttl time.Duration
 }
 
