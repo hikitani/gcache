@@ -5,6 +5,8 @@ import (
 	"time"
 )
 
+type ItemConstructor func(key string) interface{}
+
 type Cache interface {
 	// Returns item and boolean value for check of key existing
 	Get(key string) (*Item, bool)
@@ -16,6 +18,8 @@ type Cache interface {
 	GetOrAdd(key string, value interface{}) *Item
 	// Returns true if key exists.
 	Contains(key string) bool
+	// Sets item constructor, which called when trying to access a non-existing key
+	SetItemConstructor(f ItemConstructor)
 	// Returns count of items in the cache
 	Count() int
 }
@@ -56,6 +60,16 @@ type cacheImpl struct {
 
 	// Default TTL
 	ttl time.Duration
+
+	createItem ItemConstructor
+
+	sync.RWMutex
+}
+
+func (c *cacheImpl) SetItemConstructor(f ItemConstructor) {
+	c.Lock()
+	c.createItem = f
+	c.Unlock()
 }
 
 func NewCache(ttl time.Duration) Cache {
@@ -136,12 +150,33 @@ func (c *cacheImpl) get(key string) (*Item, bool) {
 func (c *cacheImpl) Get(key string) (*Item, bool) {
 	c.partialCheckExpiration()
 	v, ok := c.get(key)
+	var deleted bool
 	if ok {
-		if ok := c.deleteIfOld(key, v); ok {
+		deleted = c.deleteIfOld(key, v)
+
+		if !deleted {
+			v.updateTimeAccess()
+		}
+	}
+
+	if !ok || deleted {
+		c.RLock()
+		createItem := c.createItem
+		c.RUnlock()
+		if createItem == nil {
 			return nil, false
 		}
 
-		v.updateTimeAccess()
+		data := createItem(key)
+		if data == nil {
+			return nil, false
+		}
+		c.Add(key, data)
+
+		v, ok = c.get(key)
+		if !ok {
+			return nil, false
+		}
 	}
 
 	return v, ok

@@ -77,3 +77,21 @@ func TestCacheTtl(t *testing.T) {
 	assert.Equal(t, 3, c.(*cacheImpl).lastIdx)
 	assert.Equal(t, map[int]string{0: "k1", 1: "k4", 2: "k3"}, c.(*cacheImpl).keys)
 }
+
+func TestItemConstructor(t *testing.T) {
+	c := NewCache(1 * time.Second)
+	c.SetItemConstructor(func(key string) interface{} {
+		return "default"
+	})
+
+	v, ok := c.Get("new key")
+	assert.Equal(t, "default", v.Value.(string))
+	assert.Equal(t, true, ok)
+
+	c.Add("k1", "hello")
+	time.Sleep(2 * time.Second)
+
+	v, ok = c.Get("k1")
+	assert.Equal(t, "default", v.Value.(string))
+	assert.Equal(t, true, ok)
+}
