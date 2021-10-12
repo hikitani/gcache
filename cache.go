@@ -171,12 +171,8 @@ func (c *cacheImpl) Get(key string) (*Item, bool) {
 		if data == nil {
 			return nil, false
 		}
-		c.Add(key, data)
-
-		v, ok = c.get(key)
-		if !ok {
-			return nil, false
-		}
+		v = c.Add(key, data)
+		ok = true
 	}
 
 	return v, ok
