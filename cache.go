@@ -16,6 +16,8 @@ type Cache interface {
 	GetOrAdd(key string, value interface{}) *Item
 	// Returns true if key exists.
 	Contains(key string) bool
+	// Returns count of items in the cache
+	Count() int
 }
 
 type Item struct {
@@ -158,6 +160,13 @@ func (c *cacheImpl) GetOrAdd(key string, value interface{}) *Item {
 	c.tryAddKey(key)
 	item := c.add(key, value)
 	return item
+}
+
+func (c *cacheImpl) Count() int {
+	c.kvMu.RLock()
+	v := len(c.kv)
+	c.kvMu.RUnlock()
+	return v
 }
 
 func (c *cacheImpl) partialCheckExpiration() {
