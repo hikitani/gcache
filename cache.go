@@ -5,42 +5,60 @@ import (
 	"time"
 )
 
-type ItemConstructor func(key string) interface{}
-
-type Cache interface {
-	// Returns item and boolean value for check of key existing
-	Get(key string) (*Item, bool)
-	// Adds value by key and returns item object.
-	Add(key string, value interface{}) *Item
-	// Deletes item from cache by key.
-	Delete(key string)
-	// Returns item. If item doesnt exist, then it adds new value.
-	GetOrAdd(key string, value interface{}) *Item
-	// Returns true if key exists.
-	Contains(key string) bool
-	// Sets item constructor, which called when trying to access a non-existing key
-	SetItemConstructor(f ItemConstructor)
-	// Returns count of items in the cache
-	Count() int
+type keyValueTuple struct {
+	Key   string
+	Value *Item
 }
 
 type Item struct {
-	Value          interface{}
-	LastTimeAccess time.Time
+	value      interface{}
+	lastAccess time.Time
+	created    time.Time
+	ttl        time.Duration
+
+	sync.RWMutex
 }
 
-func NewItem(v interface{}) *Item {
+func NewItem(v interface{}, ttl time.Duration) *Item {
+	now := time.Now()
 	return &Item{
-		Value:          v,
-		LastTimeAccess: time.Now(),
+		value:      v,
+		lastAccess: now,
+		created:    now,
+		ttl:        ttl,
 	}
 }
 
-func (i *Item) updateTimeAccess() {
-	i.LastTimeAccess = time.Now()
+func (i *Item) Value() interface{} {
+	return i.value
 }
 
-type cacheImpl struct {
+func (i *Item) TTL() time.Duration {
+	i.RLock()
+	v := i.ttl
+	i.RUnlock()
+	return v
+}
+
+func (i *Item) SetTTL(d time.Duration) {
+	i.Lock()
+	i.ttl = d
+	i.Unlock()
+}
+
+func (i *Item) LastAccess() time.Time {
+	return i.lastAccess
+}
+
+func (i *Item) Expired() bool {
+	return time.Since(i.LastAccess()) > i.TTL()
+}
+
+func (i *Item) updateAccess() {
+	i.lastAccess = time.Now()
+}
+
+type Cache struct {
 	// Key-value store
 	kv   map[string]*Item
 	kvMu sync.RWMutex
@@ -61,19 +79,15 @@ type cacheImpl struct {
 	// Default TTL
 	ttl time.Duration
 
-	createItem ItemConstructor
+	createItem    func(key string) interface{}
+	evictionItems chan *keyValueTuple
+	evMu          sync.RWMutex
 
 	sync.RWMutex
 }
 
-func (c *cacheImpl) SetItemConstructor(f ItemConstructor) {
-	c.Lock()
-	c.createItem = f
-	c.Unlock()
-}
-
-func NewCache(ttl time.Duration) Cache {
-	return &cacheImpl{
+func NewCache(ttl time.Duration) *Cache {
+	return &Cache{
 		kv:      make(map[string]*Item),
 		keys:    make(map[int]string),
 		freeIds: newStack(),
@@ -81,16 +95,40 @@ func NewCache(ttl time.Duration) Cache {
 	}
 }
 
-func (c *cacheImpl) add(key string, value interface{}) *Item {
-	item := NewItem(value)
-	c.kvMu.Lock()
-	c.kv[key] = item
-	c.kvMu.Unlock()
-
-	return item
+// Sets item constructor, which called when trying to access a non-existing key (Optional).
+func (c *Cache) SetItemConstructor(f func(key string) interface{}) {
+	c.Lock()
+	c.createItem = f
+	c.Unlock()
 }
 
-func (c *cacheImpl) Add(key string, value interface{}) *Item {
+// Sets callback, which called when item is evicted from cache (Optional).
+func (c *Cache) OnEvicted(f func(key string, v *Item)) {
+	if c.evictionItems != nil {
+		chanNotClosed := true
+		select {
+		case _, chanNotClosed = <-c.evictionItems:
+		default:
+		}
+
+		if chanNotClosed {
+			close(c.evictionItems)
+		}
+	}
+
+	c.evMu.Lock()
+	c.evictionItems = make(chan *keyValueTuple, 1000)
+	c.evMu.Unlock()
+	go func() {
+		for kv := range c.evictionItems {
+			f(kv.Key, kv.Value)
+		}
+	}()
+}
+
+// Adds value by key with default TTL and returns item object.
+// Use SetTTL of item for change default TTL.
+func (c *Cache) Add(key string, value interface{}) *Item {
 	c.partialCheckExpiration()
 	c.tryAddKey(key)
 	item := c.add(key, value)
@@ -98,15 +136,8 @@ func (c *cacheImpl) Add(key string, value interface{}) *Item {
 	return item
 }
 
-func (c *cacheImpl) contains(key string) bool {
-	c.kvMu.RLock()
-	_, ok := c.kv[key]
-	c.kvMu.RUnlock()
-
-	return ok
-}
-
-func (c *cacheImpl) Contains(key string) bool {
+// Returns true if key exists.
+func (c *Cache) Contains(key string) bool {
 	c.partialCheckExpiration()
 	v, ok := c.get(key)
 	if ok {
@@ -114,40 +145,20 @@ func (c *cacheImpl) Contains(key string) bool {
 			return false
 		}
 
-		v.updateTimeAccess()
+		v.updateAccess()
 	}
 	return ok
 }
 
-func (c *cacheImpl) delete(key string) {
-	c.kvMu.Lock()
-	delete(c.kv, key)
-	c.kvMu.Unlock()
-}
-
-func (c *cacheImpl) deleteIfOld(key string, item *Item) bool {
-	if time.Since(item.LastTimeAccess) > c.ttl {
-		c.delete(key)
-		return true
-	}
-
-	return false
-}
-
-func (c *cacheImpl) Delete(key string) {
+// Deletes item from cache by key.
+func (c *Cache) Delete(key string) {
 	c.partialCheckExpiration()
 	c.delete(key)
 }
 
-func (c *cacheImpl) get(key string) (*Item, bool) {
-	c.kvMu.RLock()
-	v, ok := c.kv[key]
-	c.kvMu.RUnlock()
-
-	return v, ok
-}
-
-func (c *cacheImpl) Get(key string) (*Item, bool) {
+// Returns item and boolean value for check of key existings.
+// If key doesn't exist and item constructor is defined then item constructor is called.
+func (c *Cache) Get(key string) (*Item, bool) {
 	c.partialCheckExpiration()
 	v, ok := c.get(key)
 	var deleted bool
@@ -155,7 +166,7 @@ func (c *cacheImpl) Get(key string) (*Item, bool) {
 		deleted = c.deleteIfOld(key, v)
 
 		if !deleted {
-			v.updateTimeAccess()
+			v.updateAccess()
 		}
 	}
 
@@ -178,47 +189,80 @@ func (c *cacheImpl) Get(key string) (*Item, bool) {
 	return v, ok
 }
 
-func (c *cacheImpl) GetOrAdd(key string, value interface{}) *Item {
-	c.partialCheckExpiration()
-
-	if v, ok := c.get(key); ok {
-		if deleted := c.deleteIfOld(key, v); !deleted {
-			v.updateTimeAccess()
-			return v
-		}
-	}
-
-	c.tryAddKey(key)
-	item := c.add(key, value)
-	return item
-}
-
-func (c *cacheImpl) Count() int {
+// Returns count of items in the cache
+func (c *Cache) Count() int {
 	c.kvMu.RLock()
 	v := len(c.kv)
 	c.kvMu.RUnlock()
 	return v
 }
 
-func (c *cacheImpl) partialCheckExpiration() {
-	it := c.nextIt()
+func (c *Cache) add(key string, value interface{}) *Item {
+	item := NewItem(value, c.ttl)
+	c.kvMu.Lock()
+	c.kv[key] = item
+	c.kvMu.Unlock()
 
-	k, ok := c.getKeyByIdx(it)
-	if ok {
-		v, ok := c.get(k)
+	return item
+}
 
-		if ok {
-			if time.Since(v.LastTimeAccess) > c.ttl {
-				c.delete(k)
-				c.deleteKeyByIdx(it)
-			}
-		} else {
-			c.deleteKeyByIdx(it)
+func (c *Cache) contains(key string) bool {
+	c.kvMu.RLock()
+	_, ok := c.kv[key]
+	c.kvMu.RUnlock()
+
+	return ok
+}
+
+func (c *Cache) delete(key string) {
+	v, _ := c.get(key)
+
+	c.kvMu.Lock()
+	_, ok := c.kv[key]
+	delete(c.kv, key)
+	c.kvMu.Unlock()
+
+	if ok && v != nil && c.evictionItems != nil {
+		c.evMu.RLock()
+		c.evictionItems <- &keyValueTuple{
+			Key:   key,
+			Value: v,
 		}
+		c.evMu.RUnlock()
 	}
 }
 
-func (c *cacheImpl) getKeyByIdx(v int) (string, bool) {
+func (c *Cache) deleteIfOld(key string, v *Item) bool {
+	if v.Expired() {
+		c.delete(key)
+		return true
+	}
+
+	return false
+}
+
+func (c *Cache) get(key string) (*Item, bool) {
+	c.kvMu.RLock()
+	v, ok := c.kv[key]
+	c.kvMu.RUnlock()
+
+	return v, ok
+}
+
+func (c *Cache) partialCheckExpiration() {
+	it := c.nextIt()
+
+	if k, ok := c.getKeyByIdx(it); !ok {
+		return
+	} else if v, ok := c.get(k); !ok {
+		c.deleteKeyByIdx(it)
+	} else if v.Expired() {
+		c.delete(k)
+		c.deleteKeyByIdx(it)
+	}
+}
+
+func (c *Cache) getKeyByIdx(v int) (string, bool) {
 	c.kMu.RLock()
 	k, ok := c.keys[v]
 	c.kMu.RUnlock()
@@ -226,7 +270,7 @@ func (c *cacheImpl) getKeyByIdx(v int) (string, bool) {
 	return k, ok
 }
 
-func (c *cacheImpl) getLastIdx() int {
+func (c *Cache) getLastIdx() int {
 	c.lastIdxMu.RLock()
 	idx := c.lastIdx
 	c.lastIdxMu.RUnlock()
@@ -234,16 +278,14 @@ func (c *cacheImpl) getLastIdx() int {
 	return idx
 }
 
-func (c *cacheImpl) incLastIdx() {
+func (c *Cache) incLastIdx() {
 	c.lastIdxMu.Lock()
 	c.lastIdx++
 	c.lastIdxMu.Unlock()
 }
 
-func (c *cacheImpl) nextIt() int {
-	c.lastIdxMu.RLock()
-	lastIdx := c.lastIdx
-	c.lastIdxMu.RUnlock()
+func (c *Cache) nextIt() int {
+	lastIdx := c.getLastIdx()
 
 	if lastIdx == 0 {
 		return 0
@@ -257,7 +299,7 @@ func (c *cacheImpl) nextIt() int {
 	return it
 }
 
-func (c *cacheImpl) tryAddKey(key string) {
+func (c *Cache) tryAddKey(key string) {
 	if c.contains(key) {
 		return
 	}
@@ -273,7 +315,7 @@ func (c *cacheImpl) tryAddKey(key string) {
 	c.kMu.Unlock()
 }
 
-func (c *cacheImpl) deleteKeyByIdx(idx int) {
+func (c *Cache) deleteKeyByIdx(idx int) {
 	c.kMu.Lock()
 	delete(c.keys, idx)
 	c.kMu.Unlock()
