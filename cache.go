@@ -51,7 +51,7 @@ func (i *Item) LastAccess() time.Time {
 }
 
 func (i *Item) Expired() bool {
-	return time.Since(i.LastAccess()) > i.TTL()
+	return time.Since(i.lastAccess) > i.ttl
 }
 
 func (i *Item) updateAccess() {
