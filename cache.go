@@ -3,6 +3,8 @@ package gcache
 import (
 	"sync"
 	"time"
+
+	cmap "github.com/orcaman/concurrent-map"
 )
 
 type keyValueTuple struct {
@@ -60,7 +62,7 @@ func (i *Item) updateAccess() {
 
 type Cache struct {
 	// Key-value store
-	kv   map[string]*Item
+	kv   cmap.ConcurrentMap
 	kvMu sync.RWMutex
 
 	// Index-key store
@@ -88,7 +90,7 @@ type Cache struct {
 
 func NewCache(ttl time.Duration) *Cache {
 	return &Cache{
-		kv:      make(map[string]*Item),
+		kv:      cmap.New(),
 		keys:    make(map[int]string),
 		freeIds: newStack(),
 		ttl:     ttl,
@@ -191,35 +193,26 @@ func (c *Cache) Get(key string) (*Item, bool) {
 
 // Returns count of items in the cache
 func (c *Cache) Count() int {
-	c.kvMu.RLock()
-	v := len(c.kv)
-	c.kvMu.RUnlock()
-	return v
+	return c.kv.Count()
 }
 
 func (c *Cache) add(key string, value interface{}) *Item {
 	item := NewItem(value, c.ttl)
-	c.kvMu.Lock()
-	c.kv[key] = item
-	c.kvMu.Unlock()
+	c.kv.Set(key, item)
 
 	return item
 }
 
 func (c *Cache) contains(key string) bool {
-	c.kvMu.RLock()
-	_, ok := c.kv[key]
-	c.kvMu.RUnlock()
-
-	return ok
+	return c.kv.Has(key)
 }
 
 func (c *Cache) delete(key string) {
 	v, _ := c.get(key)
 
 	c.kvMu.Lock()
-	_, ok := c.kv[key]
-	delete(c.kv, key)
+	ok := c.kv.Has(key)
+	c.kv.Remove(key)
 	c.kvMu.Unlock()
 
 	if ok && v != nil && c.evictionItems != nil {
@@ -242,11 +235,12 @@ func (c *Cache) deleteIfOld(key string, v *Item) bool {
 }
 
 func (c *Cache) get(key string) (*Item, bool) {
-	c.kvMu.RLock()
-	v, ok := c.kv[key]
-	c.kvMu.RUnlock()
+	v, ok := c.kv.Get(key)
+	if ok {
+		return v.(*Item), ok
+	}
 
-	return v, ok
+	return nil, ok
 }
 
 func (c *Cache) partialCheckExpiration() {
