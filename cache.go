@@ -95,6 +95,15 @@ func NewCache(ttl time.Duration) *Cache {
 	}
 }
 
+func NewCacheWithInitSize(ttl time.Duration, s int) *Cache {
+	return &Cache{
+		kv:      make(map[string]*Item, s),
+		keys:    make(map[int]string),
+		freeIds: newStack(),
+		ttl:     ttl,
+	}
+}
+
 // Sets item constructor, which called when trying to access a non-existing key (Optional).
 func (c *Cache) SetItemConstructor(f func(key string) interface{}) {
 	c.Lock()
